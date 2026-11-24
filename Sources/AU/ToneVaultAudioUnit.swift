@@ -55,7 +55,7 @@ enum EffectBlock: Int, CaseIterable, Identifiable {
         }
     }
 
-    var enableParamIndex: Int { Int(TVParamGateOn.rawValue) + rawValue }
+    var enableParamIndex: Int { 6 + rawValue }
 
     var knobIndices: [Int] {
         switch self {
@@ -160,7 +160,7 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
     private(set) var modelName: String?
     private(set) var irName: String?
     private(set) var presetName: String = "Default"
-    private(set) var chainOrder: [Int] = Array(0..<Int(TVBlockCount.rawValue))
+    private(set) var chainOrder: [Int] = Array(0..<EffectBlock.allCases.count)
 
     public override init(componentDescription: AudioComponentDescription,
                          options: AudioComponentInstantiationOptions = []) throws {
@@ -319,7 +319,7 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
 
     // MARK: - Chain Order & Presets
     func setChainOrder(_ order: [Int]) {
-        guard order.count == Int(TVBlockCount.rawValue), Set(order).count == order.count else { return }
+        guard order.count == EffectBlock.allCases.count, Set(order).count == order.count else { return }
         chainOrder = order
         let cOrder = order.map { Int32($0) }
         cOrder.withUnsafeBufferPointer { ptr in

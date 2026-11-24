@@ -197,11 +197,11 @@ struct PluginView: View {
 
             Image(systemName: blk.icon)
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(on ? .white : .secondary)
+                .foregroundStyle(on ? Color.white : Color.secondary)
 
             Text(blk.shortName)
                 .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                .foregroundStyle(on ? .white : .secondary)
+                .foregroundStyle(on ? Color.white : Color.secondary)
                 .padding(.bottom, 5)
         }
         .frame(width: 50)
@@ -229,7 +229,7 @@ struct PluginView: View {
                     }
                     .padding(.horizontal, 9).padding(.vertical, 4)
                     .background(on ? AnyShapeStyle(Theme.gradient) : AnyShapeStyle(Color.white.opacity(0.08)), in: Capsule())
-                    .foregroundStyle(on ? .white : .secondary)
+                    .foregroundStyle(on ? Color.white : Color.secondary)
                 }.buttonStyle(.plain)
 
                 Text(blk.title)
@@ -246,7 +246,7 @@ struct PluginView: View {
                             .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(model.canMove(blk, by: -1) ? .white : .white.opacity(0.25))
+                    .foregroundStyle(model.canMove(blk, by: -1) ? Color.white : Color.white.opacity(0.25))
                     .disabled(!model.canMove(blk, by: -1))
 
                     Button { model.move(blk, by: 1) } label: {
@@ -255,7 +255,7 @@ struct PluginView: View {
                             .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(model.canMove(blk, by: 1) ? .white : .white.opacity(0.25))
+                    .foregroundStyle(model.canMove(blk, by: 1) ? Color.white : Color.white.opacity(0.25))
                     .disabled(!model.canMove(blk, by: 1))
                 }
             }
@@ -411,7 +411,7 @@ struct PluginView: View {
                                     PresetStore.delete(named: p.name)
                                     model.refreshLists()
                                 } label: {
-                                    Image(systemName: "trash").font(.caption).foregroundStyle(.red.opacity(0.8))
+                                    Image(systemName: "trash").font(.caption).foregroundStyle(Color.red.opacity(0.8))
                                 }.buttonStyle(.plain).padding(.leading, 6)
                             }
                             .padding(10).background(Theme.card, in: RoundedRectangle(cornerRadius: 10))

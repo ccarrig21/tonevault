@@ -17,9 +17,10 @@ jobs:
         run: xcodegen generate
       - name: Build (unsigned)
         run: |
+          set -o pipefail
           xcodebuild -project ToneVault.xcodeproj -scheme ToneVault \
             -configuration Release -sdk iphoneos -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -n 60
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -n 120
       - name: Package IPA (keeps entitlements for re-signing)
         run: |
           APP=build/Build/Products/Release-iphoneos/ToneVault.app

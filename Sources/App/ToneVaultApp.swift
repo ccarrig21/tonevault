@@ -172,7 +172,7 @@ struct LibraryView: View {
             }
             .navigationTitle("Library")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button { showImporter = true } label: { Image(systemName: "plus") }
                 }
             }
