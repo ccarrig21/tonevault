@@ -15,14 +15,14 @@ public class AudioUnitViewController: AUViewController, AUAudioUnitFactory, UIDo
 
     public override func viewDidLoad() {
         super.viewDidLoad()
-        preferredContentSize = CGSize(width: 440, height: 330)
+        preferredContentSize = CGSize(width: 520, height: 390)
         connect()
     }
 
     private func connect() {
         guard isViewLoaded, host == nil, let au = audioUnit else { return }
         let model = PluginModel(au: au)
-        model.importAction = { [weak self] in self?.importModels() }
+        model.importAction = { [weak self] in self?.importFiles() }
         let h = UIHostingController(rootView: PluginView(model: model))
         addChild(h)
         h.view.translatesAutoresizingMaskIntoConstraints = false
@@ -38,19 +38,29 @@ public class AudioUnitViewController: AUViewController, AUAudioUnitFactory, UIDo
         host = h
     }
 
-    private func importModels() {
-        let p = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: true)
+    private func importFiles() {
+        let types: [UTType] = [.data, .audio, .wav, .aiff]
+        let p = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
         p.allowsMultipleSelection = true
         p.delegate = self
         present(p, animated: true)
     }
 
     public func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        for u in urls where u.pathExtension.lowercased() == "nam" {
-            let dest = ModelStore.localDir.appendingPathComponent(u.lastPathComponent)
+        for u in urls {
+            let ext = u.pathExtension.lowercased()
+            let destDir: URL
+            if ModelStore.exts.contains(ext) {
+                destDir = ModelStore.localDir
+            } else if IRStore.exts.contains(ext) {
+                destDir = IRStore.localDir
+            } else {
+                continue
+            }
+            let dest = destDir.appendingPathComponent(u.lastPathComponent)
             try? FileManager.default.removeItem(at: dest)
             try? FileManager.default.copyItem(at: u, to: dest)
         }
-        host?.rootView.model.models = ModelStore.list()
+        host?.rootView.model.refreshLists()
     }
 }

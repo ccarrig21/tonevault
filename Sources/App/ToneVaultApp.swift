@@ -1,9 +1,13 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct ToneVaultApp: App {
     @StateObject private var api = TONE3000()
-    init() { ModelStore.syncLocalToGroup() }
+    init() {
+        ModelStore.syncLocalToGroup()
+        IRStore.syncLocalToGroup()
+    }
     var body: some Scene {
         WindowGroup {
             RootView().environmentObject(api).preferredColorScheme(.dark).tint(Theme.accent)
@@ -124,25 +128,81 @@ struct ToneDetailView: View {
 }
 
 struct LibraryView: View {
-    @State private var files = ModelStore.list()
+    @State private var tab = 0 // 0 = Amps (.nam), 1 = Cab IRs (.wav)
+    @State private var models = ModelStore.list()
+    @State private var irs = IRStore.list()
+    @State private var showImporter = false
+
+    private var activeFiles: [ModelFile] { tab == 0 ? models : irs }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 Backdrop()
-                if files.isEmpty {
-                    Text("No models yet.\nDownload some from Browse, or drop .nam files into\nFiles › On My iPhone › ToneVault › Models.")
-                        .multilineTextAlignment(.center).foregroundStyle(.secondary).padding()
-                } else {
-                    List {
-                        ForEach(files) { f in Text(f.name).listRowBackground(Theme.card) }
-                            .onDelete { idx in idx.map { files[$0] }.forEach(ModelStore.delete); files = ModelStore.list() }
-                    }.scrollContentBackground(.hidden)
+                VStack(spacing: 10) {
+                    SegmentBar(options: ["Amps (.nam)", "Cab IRs (.wav)"], selection: $tab)
+                        .padding(.top, 6)
+
+                    if activeFiles.isEmpty {
+                        Spacer()
+                        Text(tab == 0
+                             ? "No amp models yet.\nDownload from Browse, tap +, or drop .nam files into\nFiles › On My iPhone › ToneVault › Models."
+                             : "No cabinet IRs yet.\nTap + to import .wav files, or drop them into\nFiles › On My iPhone › ToneVault › IRs.")
+                            .multilineTextAlignment(.center).foregroundStyle(.secondary).padding()
+                        Spacer()
+                    } else {
+                        List {
+                            ForEach(activeFiles) { f in
+                                HStack {
+                                    Image(systemName: tab == 0 ? "waveform" : "hifispeaker.fill")
+                                        .foregroundStyle(Theme.accent)
+                                    Text(f.name)
+                                }
+                                .listRowBackground(Theme.card)
+                            }
+                            .onDelete { idx in
+                                let items = idx.map { activeFiles[$0] }
+                                if tab == 0 { items.forEach(ModelStore.delete) }
+                                else { items.forEach(IRStore.delete) }
+                                reload()
+                            }
+                        }.scrollContentBackground(.hidden)
+                    }
                 }
             }
             .navigationTitle("Library")
-            .onAppear { ModelStore.syncLocalToGroup(); files = ModelStore.list() }
-            .refreshable { files = ModelStore.list() }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showImporter = true } label: { Image(systemName: "plus") }
+                }
+            }
+            .fileImporter(isPresented: $showImporter,
+                          allowedContentTypes: [.data, .audio, .wav, .aiff],
+                          allowsMultipleSelection: true) { result in
+                guard case .success(let urls) = result else { return }
+                for u in urls {
+                    let scoped = u.startAccessingSecurityScopedResource()
+                    defer { if scoped { u.stopAccessingSecurityScopedResource() } }
+                    let ext = u.pathExtension.lowercased()
+                    let dir: URL? = ModelStore.exts.contains(ext) ? ModelStore.writeDir
+                        : (IRStore.exts.contains(ext) ? IRStore.writeDir : nil)
+                    guard let dir else { continue }
+                    let dest = dir.appendingPathComponent(u.lastPathComponent)
+                    try? FileManager.default.removeItem(at: dest)
+                    try? FileManager.default.copyItem(at: u, to: dest)
+                }
+                reload()
+            }
+            .onAppear { reload() }
+            .refreshable { reload() }
         }
+    }
+
+    private func reload() {
+        ModelStore.syncLocalToGroup()
+        IRStore.syncLocalToGroup()
+        models = ModelStore.list()
+        irs = IRStore.list()
     }
 }
 
