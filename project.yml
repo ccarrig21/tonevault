@@ -1,6 +1,6 @@
 name: ToneVault
 options:
-  bundleIdPrefix: com.example
+  bundleIdPrefix: com.thund
   deploymentTarget: { iOS: "16.0" }
   createIntermediateGroups: true
 settings:
@@ -19,11 +19,11 @@ targets:
       - target: ToneVaultAU
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.tonevault
+        PRODUCT_BUNDLE_IDENTIFIER: com.thund.tonevault
     entitlements:
       path: Entitlements/App.entitlements
       properties:
-        com.apple.security.application-groups: [group.com.example.tonevault]
+        com.apple.security.application-groups: [group.com.thund.tonevault]
     info:
       path: Sources/App/Info.plist
       properties:
@@ -44,7 +44,7 @@ targets:
       - Vendor/NeuralAmpModelerCore/NAM
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.tonevault.au
+        PRODUCT_BUNDLE_IDENTIFIER: com.thund.tonevault.au
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AU/Bridging.h
         CLANG_CXX_LANGUAGE_STANDARD: gnu++17
         GCC_WARN_INHIBIT_ALL_WARNINGS: YES
@@ -60,7 +60,7 @@ targets:
     entitlements:
       path: Entitlements/AU.entitlements
       properties:
-        com.apple.security.application-groups: [group.com.example.tonevault]
+        com.apple.security.application-groups: [group.com.thund.tonevault]
     info:
       path: Sources/AU/Info.plist
       properties:
