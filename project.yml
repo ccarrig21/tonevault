@@ -1,0 +1,81 @@
+name: ToneVault
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget: { iOS: "16.0" }
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+targets:
+  ToneVault:
+    type: application
+    platform: iOS
+    sources: [Sources/App, Sources/Shared]
+    dependencies:
+      - target: ToneVaultAU
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.tonevault
+    entitlements:
+      path: Entitlements/App.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.example.tonevault]
+    info:
+      path: Sources/App/Info.plist
+      properties:
+        CFBundleDisplayName: ToneVault
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        CFBundleURLTypes:
+          - CFBundleURLName: tone3000.callback
+            CFBundleURLSchemes: [tonevault]
+  ToneVaultAU:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Sources/AU
+      - Sources/Shared
+      - Vendor/NeuralAmpModelerCore/NAM
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.tonevault.au
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AU/Bridging.h
+        CLANG_CXX_LANGUAGE_STANDARD: gnu++17
+        GCC_WARN_INHIBIT_ALL_WARNINGS: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/Vendor/NeuralAmpModelerCore
+          - $(SRCROOT)/Vendor/NeuralAmpModelerCore/Dependencies
+          - $(SRCROOT)/Vendor/NeuralAmpModelerCore/Dependencies/eigen
+          - $(SRCROOT)/Vendor/NeuralAmpModelerCore/Dependencies/nlohmann
+      configs:
+        Release:
+          GCC_OPTIMIZATION_LEVEL: "3"
+    entitlements:
+      path: Entitlements/AU.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.example.tonevault]
+    info:
+      path: Sources/AU/Info.plist
+      properties:
+        CFBundleDisplayName: ToneVault
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.AudioUnit-UI
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).AudioUnitViewController
+          NSExtensionAttributes:
+            AudioComponents:
+              - name: "ToneVault: ToneVault"
+                description: Neural amp modeler with TONE3000 browser
+                factoryFunction: $(PRODUCT_MODULE_NAME).AudioUnitViewController
+                manufacturer: Tnvt
+                subtype: Tnv1
+                type: aufx
+                version: 1
+                sandboxSafe: true
+                tags: [Effects, Guitar]
