@@ -1,81 +1,48 @@
-name: ToneVault
-options:
-  bundleIdPrefix: com.thund
-  deploymentTarget: { iOS: "16.0" }
-  createIntermediateGroups: true
-settings:
-  base:
-    SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
-    TARGETED_DEVICE_FAMILY: "1,2"
-    CODE_SIGN_STYLE: Automatic
-targets:
-  ToneVault:
-    type: application
-    platform: iOS
-    sources: [Sources/App, Sources/Shared]
-    dependencies:
-      - target: ToneVaultAU
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.thund.tonevault
-    entitlements:
-      path: Entitlements/App.entitlements
-      properties:
-        com.apple.security.application-groups: [group.com.thund.tonevault]
-    info:
-      path: Sources/App/Info.plist
-      properties:
-        CFBundleDisplayName: ToneVault
-        UILaunchScreen: {}
-        UIFileSharingEnabled: true
-        LSSupportsOpeningDocumentsInPlace: true
-        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
-        CFBundleURLTypes:
-          - CFBundleURLName: tone3000.callback
-            CFBundleURLSchemes: [tonevault]
-  ToneVaultAU:
-    type: app-extension
-    platform: iOS
-    sources:
-      - Sources/AU
-      - Sources/Shared
-      - Vendor/NeuralAmpModelerCore/NAM
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.thund.tonevault.au
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/AU/Bridging.h
-        CLANG_CXX_LANGUAGE_STANDARD: gnu++17
-        GCC_WARN_INHIBIT_ALL_WARNINGS: YES
-        APPLICATION_EXTENSION_API_ONLY: YES
-        HEADER_SEARCH_PATHS:
-          - $(SRCROOT)/Vendor/NeuralAmpModelerCore
-          - $(SRCROOT)/Vendor/NeuralAmpModelerCore/Dependencies
-          - $(SRCROOT)/Vendor/NeuralAmpModelerCore/Dependencies/eigen
-          - $(SRCROOT)/Vendor/NeuralAmpModelerCore/Dependencies/nlohmann
-      configs:
-        Release:
-          GCC_OPTIMIZATION_LEVEL: "3"
-    entitlements:
-      path: Entitlements/AU.entitlements
-      properties:
-        com.apple.security.application-groups: [group.com.thund.tonevault]
-    info:
-      path: Sources/AU/Info.plist
-      properties:
-        CFBundleDisplayName: ToneVault
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.AudioUnit-UI
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).AudioUnitViewController
-          NSExtensionAttributes:
-            AudioComponents:
-              - name: "ToneVault: ToneVault"
-                description: Neural amp modeler with TONE3000 browser
-                factoryFunction: $(PRODUCT_MODULE_NAME).AudioUnitViewController
-                manufacturer: Tnvt
-                subtype: Tnv1
-                type: aufx
-                version: 1
-                sandboxSafe: true
-                tags: [Effects, Guitar]
+name: Build IPA
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+  release: { types: [published] }
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: Tools
+        run: brew install xcodegen ldid
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project ToneVault.xcodeproj -scheme ToneVault \
+            -configuration Release -sdk iphoneos -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -n 60
+      - name: Package IPA (keeps entitlements for re-signing)
+        run: |
+          APP=build/Build/Products/Release-iphoneos/ToneVault.app
+          GROUP=$(grep -o 'group\.[A-Za-z0-9.]*' Sources/Shared/Config.swift | head -1)
+          echo "App group: $GROUP"
+          cat > "$RUNNER_TEMP/ent.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>com.apple.security.application-groups</key><array><string>$GROUP</string></array>
+          </dict></plist>
+          EOF
+          find "$APP" -maxdepth 3 | head -40
+          APPEX=$(find "$APP/PlugIns" -maxdepth 1 -name "*.appex" | head -1)
+          APPEX_EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APPEX/Info.plist")
+          APP_EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          ldid -S"$RUNNER_TEMP/ent.plist" "$APPEX/$APPEX_EXE"
+          ldid -S"$RUNNER_TEMP/ent.plist" "$APP/$APP_EXE"
+          mkdir Payload && cp -R "$APP" Payload/ && zip -qry ToneVault.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with: { name: ToneVault-ipa, path: ToneVault.ipa }
+      - name: Attach to release
+        if: github.event_name == 'release'
+        run: gh release upload "${{ github.event.release.tag_name }}" ToneVault.ipa --clobber
+        env: { GH_TOKEN: "${{ github.token }}" }
