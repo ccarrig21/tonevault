@@ -119,7 +119,9 @@ void NAMEngineProcess(NAMEngineRef r, const float *in, float *oL, float *oR, int
     }
     {
         std::unique_lock<std::mutex> lk(e->m, std::try_to_lock);
-        if (lk.owns_lock() && e->dsp) e->dsp->process(e->inBuf.data(), e->outBuf.data(), n);
+        NAM_SAMPLE *inCh[1] = {e->inBuf.data()};
+        NAM_SAMPLE *outCh[1] = {e->outBuf.data()};
+        if (lk.owns_lock() && e->dsp) e->dsp->process(inCh, outCh, n);
         else std::copy(e->inBuf.begin(), e->inBuf.begin() + n, e->outBuf.begin()); // no model: pass dry
     }
     for (int i = 0; i < n; i++) {
