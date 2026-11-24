@@ -16,10 +16,16 @@
 
 namespace {
 
-inline uint32_t packOrder(const int *order) {
-    uint32_t v = 0;
+static constexpr int kEnableParam[TVBlockCount] = {
+    TVParamGateOn, TVParamCompOn, TVParamDriveOn, TVParamAmpOn,
+    TVParamCabOn, TVParamModOn, TVParamDelayOn, TVParamReverbOn,
+    TVParamDenoiseOn
+};
+
+inline uint64_t packOrder(const int *order) {
+    uint64_t v = 0;
     for (int i = 0; i < TVBlockCount; ++i) {
-        v |= (uint32_t)(order[i] & 0xF) << (i * 4);
+        v |= (uint64_t)(order[i] & 0xF) << (i * 4);
     }
     return v;
 }
@@ -40,12 +46,15 @@ struct Engine {
     std::atomic<float> p[TVParamCount];
     std::atomic<bool> eqDirty{true};
     std::atomic<bool> cabDirty{true};
-    std::atomic<uint32_t> chainOrder{0x76543210u}; // default 0,1,2,3,4,5,6,7
+    // Default order: Denoise(8), Gate(0), Comp(1), Drive(2), Amp(3), Cab(4), Mod(5), Delay(6), Reverb(7)
+    std::atomic<uint64_t> chainOrder{0x765432108ULL};
 
     // DSP units
     tv::Biquad eqLo, eqMid, eqHi;
     tv::Biquad cabHP, cabLP;
     float gateEnv = 0.0f, gateGain = 1.0f;
+    tv::SpectralDenoiser denoise;
+    bool denoiseWasActive = false;
     tv::Compressor comp;
     tv::Overdrive drive;
     tv::Modulation mod;
@@ -53,7 +62,7 @@ struct Engine {
     tv::FDNReverb reverb;
 
     // Clickless per-block bypass smoothing
-    std::array<float, TVBlockCount> blkSmooth{1, 0, 0, 1, 1, 0, 0, 0};
+    std::array<float, TVBlockCount> blkSmooth{1, 0, 0, 1, 1, 0, 0, 0, 0};
 
     Engine() {
         const float defs[TVParamCount] = {
@@ -65,7 +74,8 @@ struct Engine {
             80, 9500, 0,                           // 25..27 cab
             0, 1.2f, 50, 45,                       // 28..31 mod
             1, 360, 38, 4200, 28,                  // 32..36 delay
-            1, 2.2f, 20, 6500, 25                  // 37..41 reverb
+            1, 2.2f, 20, 6500, 25,                 // 37..41 reverb
+            0, 24, 3, 45, 100                      // 42..46 denoise
         };
         for (int i = 0; i < TVParamCount; ++i) p[i].store(defs[i], std::memory_order_relaxed);
     }
@@ -164,6 +174,8 @@ void NAMEnginePrepare(NAMEngineRef r, double sr, int maxFrames) {
     e->cabHP.reset(); e->cabLP.reset();
     e->gateEnv = 0.0f; e->gateGain = 1.0f;
 
+    e->denoise.prepare(e->sr);
+    e->denoiseWasActive = false;
     e->comp.prepare(e->sr);
     e->drive.prepare(e->sr);
     e->mod.prepare(e->sr);
@@ -241,6 +253,30 @@ void NAMEngineSetChainOrder(NAMEngineRef r, const int *order, int count) {
     e->chainOrder.store(packOrder(order), std::memory_order_relaxed);
 }
 
+void NAMEngineStartNoiseLearn(NAMEngineRef r, float seconds) {
+    static_cast<Engine *>(r)->denoise.startLearn(seconds);
+}
+
+void NAMEngineClearNoiseProfile(NAMEngineRef r) {
+    static_cast<Engine *>(r)->denoise.clearProfile();
+}
+
+int NAMEngineGetNoiseLearnState(NAMEngineRef r) {
+    return static_cast<Engine *>(r)->denoise.getState();
+}
+
+float NAMEngineGetNoiseLearnProgress(NAMEngineRef r) {
+    return static_cast<Engine *>(r)->denoise.getProgress();
+}
+
+int NAMEngineGetNoiseProfile(NAMEngineRef r, float *outBins, int maxBins) {
+    return static_cast<Engine *>(r)->denoise.getProfile(outBins, maxBins);
+}
+
+void NAMEngineSetNoiseProfile(NAMEngineRef r, const float *bins, int count) {
+    static_cast<Engine *>(r)->denoise.setProfile(bins, count);
+}
+
 void NAMEngineProcess(NAMEngineRef r, const float *in, float *oL, float *oR, int n) {
     auto *e = static_cast<Engine *>(r);
     if (n <= 0) return;
@@ -266,16 +302,22 @@ void NAMEngineProcess(NAMEngineRef r, const float *in, float *oL, float *oR, int
         R[i] = x;
     }
 
-    const uint32_t packed = e->chainOrder.load(std::memory_order_relaxed);
+    const uint64_t packed = e->chainOrder.load(std::memory_order_relaxed);
     const float rampStep = 1.0f / std::max(1.0f, 0.005f * (float)e->sr);
 
     for (int slot = 0; slot < TVBlockCount; ++slot) {
         const int blk = (int)((packed >> (slot * 4)) & 0xF);
-        const bool active = e->p[TVParamGateOn + blk].load(std::memory_order_relaxed) >= 0.5f;
+        if (blk < 0 || blk >= TVBlockCount) continue;
+
+        const bool active = e->p[kEnableParam[blk]].load(std::memory_order_relaxed) >= 0.5f;
         const float curMix = e->blkSmooth[blk];
 
         if (!active && curMix <= 0.0001f) {
             e->blkSmooth[blk] = 0.0f;
+            if (blk == TVBlockDenoise && e->denoiseWasActive) {
+                e->denoise.resetBuffers();
+                e->denoiseWasActive = false;
+            }
             continue;
         }
 
@@ -286,6 +328,14 @@ void NAMEngineProcess(NAMEngineRef r, const float *in, float *oL, float *oR, int
         }
 
         switch (blk) {
+            case TVBlockDenoise:
+                e->denoiseWasActive = true;
+                e->denoise.process(L, R, n,
+                    e->p[TVParamDenoiseRed].load(std::memory_order_relaxed),
+                    e->p[TVParamDenoiseSens].load(std::memory_order_relaxed),
+                    e->p[TVParamDenoiseSmooth].load(std::memory_order_relaxed),
+                    e->p[TVParamDenoiseMix].load(std::memory_order_relaxed));
+                break;
             case TVBlockGate:
                 processGate(e, L, R, n);
                 break;

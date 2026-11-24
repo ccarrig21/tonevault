@@ -67,7 +67,14 @@ enum {
     TVParamRevDamp = 40,
     TVParamRevMix = 41,
 
-    TVParamCount = 42
+    /* Spectral Denoiser */
+    TVParamDenoiseOn = 42,
+    TVParamDenoiseRed = 43,
+    TVParamDenoiseSens = 44,
+    TVParamDenoiseSmooth = 45,
+    TVParamDenoiseMix = 46,
+
+    TVParamCount = 47
 };
 
 /* Block IDs for chain ordering */
@@ -80,17 +87,26 @@ enum {
     TVBlockMod = 5,
     TVBlockDelay = 6,
     TVBlockReverb = 7,
-    TVBlockCount = 8
+    TVBlockDenoise = 8,
+    TVBlockCount = 9
 };
 
 NAMEngineRef NAMEngineCreate(void);
 void NAMEngineDestroy(NAMEngineRef);
 void NAMEnginePrepare(NAMEngineRef, double sampleRate, int maxFrames);
-bool NAMEngineLoadModel(NAMEngineRef, const char *path); /* pass NULL/"" to unload */
-bool NAMEngineLoadIR(NAMEngineRef, const float *samples, int count); /* pass NULL/0 to unload */
+bool NAMEngineLoadModel(NAMEngineRef, const char *path);
+bool NAMEngineLoadIR(NAMEngineRef, const float *samples, int count);
 void NAMEngineSetParam(NAMEngineRef, int id, float value);
 void NAMEngineSetChainOrder(NAMEngineRef, const int *order, int count);
 void NAMEngineProcess(NAMEngineRef, const float *in, float *outL, float *outR, int frames);
+
+/* Spectral Denoiser noise-profile controls */
+void NAMEngineStartNoiseLearn(NAMEngineRef, float seconds); /* <= 0 cancels */
+void NAMEngineClearNoiseProfile(NAMEngineRef);
+int NAMEngineGetNoiseLearnState(NAMEngineRef);     /* 0: empty, 1: learning, 2: ready */
+float NAMEngineGetNoiseLearnProgress(NAMEngineRef); /* 0.0 .. 1.0 */
+int NAMEngineGetNoiseProfile(NAMEngineRef, float *outBins, int maxBins);
+void NAMEngineSetNoiseProfile(NAMEngineRef, const float *bins, int count);
 
 #ifdef __cplusplus
 }

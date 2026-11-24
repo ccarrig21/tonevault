@@ -16,10 +16,13 @@ final class PluginModel: ObservableObject {
     @Published var models: [ModelFile] = []
     @Published var irs: [ModelFile] = []
     @Published var userPresets: [RigPreset] = []
+    @Published var noiseState: Int = 0
+    @Published var noiseProgress: Double = 0
 
     var importAction: (() -> Void)?
     private var token: AUParameterObserverToken?
     private var obs: NSObjectProtocol?
+    private var learnTimer: Timer?
 
     init(au: ToneVaultAudioUnit) {
         self.au = au
@@ -28,6 +31,8 @@ final class PluginModel: ObservableObject {
         modelName = au.modelName
         irName = au.irName
         presetName = au.presetName
+        noiseState = au.noiseLearnState
+        noiseProgress = au.noiseLearnProgress
 
         token = au.parameterTree?.token(byAddingParameterObserver: { [weak self] addr, val in
             DispatchQueue.main.async {
@@ -40,10 +45,13 @@ final class PluginModel: ObservableObject {
             self.irName = self.au.irName
             self.chainOrder = self.au.chainOrder
             self.presetName = self.au.presetName
+            self.noiseState = self.au.noiseLearnState
+            self.noiseProgress = self.au.noiseLearnProgress
         }
     }
 
     deinit {
+        learnTimer?.invalidate()
         if let obs { NotificationCenter.default.removeObserver(obs) }
     }
 
@@ -59,6 +67,41 @@ final class PluginModel: ObservableObject {
 
     func toggle(_ b: EffectBlock) {
         set(b.enableParamIndex, isEnabled(b) ? 0 : 1)
+    }
+
+    func toggleNoiseLearn() {
+        if noiseState == 1 {
+            au.startNoiseLearn(seconds: 0) // cancel
+            stopLearnTimer()
+            noiseState = au.noiseLearnState
+            noiseProgress = au.noiseLearnProgress
+            return
+        }
+        // Auto-enable Denoise so audio flows into the analyzer immediately
+        if !isEnabled(.denoise) { set(EffectBlock.denoise.enableParamIndex, 1) }
+        au.startNoiseLearn(seconds: 1.5)
+        noiseState = 1
+        noiseProgress = 0
+        learnTimer?.invalidate()
+        learnTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let st = self.au.noiseLearnState
+            self.noiseState = st
+            self.noiseProgress = self.au.noiseLearnProgress
+            if st != 1 { self.stopLearnTimer() }
+        }
+    }
+
+    func clearNoiseProfile() {
+        stopLearnTimer()
+        au.clearNoiseProfile()
+        noiseState = 0
+        noiseProgress = 0
+    }
+
+    private func stopLearnTimer() {
+        learnTimer?.invalidate()
+        learnTimer = nil
     }
 
     func move(_ b: EffectBlock, by delta: Int) {
@@ -120,6 +163,7 @@ final class PluginModel: ObservableObject {
 struct PluginView: View {
     @ObservedObject var model: PluginModel
     @State private var newPresetName = ""
+    @State private var presetFilter = 0 // 0: All, 1: Electric, 2: Acoustic, 3: Saved
     private let cols = [GridItem(.adaptive(minimum: 74), spacing: 8)]
 
     var body: some View {
@@ -153,7 +197,7 @@ struct PluginView: View {
                 .padding(.horizontal, 10).padding(.vertical, 5)
                 .background(Theme.card, in: Capsule())
                 .overlay(Capsule().stroke(Color.white.opacity(0.1)))
-                .foregroundStyle(.white)
+                .foregroundStyle(Color.white)
             }.buttonStyle(.plain)
 
             HStack(spacing: 4) {
@@ -220,7 +264,6 @@ struct PluginView: View {
         let blk = model.selected
         let on = model.isEnabled(blk)
         return VStack(spacing: 10) {
-            // Block header: power, title, mode picker, chain shift arrows
             HStack(spacing: 8) {
                 Button { model.toggle(blk) } label: {
                     HStack(spacing: 5) {
@@ -234,11 +277,10 @@ struct PluginView: View {
 
                 Text(blk.title)
                     .font(.system(size: 13.5, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Color.white)
 
                 Spacer(minLength: 4)
 
-                // Reorder block earlier/later in signal chain
                 HStack(spacing: 4) {
                     Button { model.move(blk, by: -1) } label: {
                         Image(systemName: "chevron.left").font(.system(size: 10, weight: .bold))
@@ -260,7 +302,6 @@ struct PluginView: View {
                 }
             }
 
-            // Optional Mode selector (Drive / Mod / Delay / Reverb)
             if let modeIdx = blk.modeParamIndex {
                 SegmentBar(
                     options: blk.modeOptions,
@@ -271,7 +312,6 @@ struct PluginView: View {
                 )
             }
 
-            // Optional File Picker bar (NAM Amp or Cab IR)
             if blk == .amp {
                 fileBar(icon: "waveform",
                         label: model.loading ? "Loading…" : (model.modelName ?? "Load a .nam model"),
@@ -280,9 +320,10 @@ struct PluginView: View {
                 fileBar(icon: "hifispeaker.fill",
                         label: model.loading ? "Loading…" : (model.irName ?? "Load a .wav Cab IR"),
                         action: { model.open(.irs) })
+            } else if blk == .denoise {
+                denoiseLearnBar
             }
 
-            // Parameter Knobs
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVGrid(columns: cols, spacing: 10) {
                     ForEach(blk.knobIndices, id: \.self) { i in
@@ -304,19 +345,66 @@ struct PluginView: View {
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.09)))
     }
 
+    private var denoiseLearnBar: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: model.noiseState == 2 ? "checkmark.circle.fill" : "mic.fill")
+                    .foregroundStyle(model.noiseState == 2 ? Color.green : Theme.accent)
+
+                Text(model.noiseState == 1 ? "Listening to hiss — stay quiet…"
+                     : (model.noiseState == 2 ? "Noise profile active" : "Stay quiet & tap Learn"))
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.white)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                if model.noiseState == 2 {
+                    Button("Clear") { model.clearNoiseProfile() }
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.secondary)
+                        .buttonStyle(.plain)
+                }
+
+                Button { model.toggleNoiseLearn() } label: {
+                    Text(model.noiseState == 1 ? "Stop" : (model.noiseState == 2 ? "Re-Learn" : "Learn Noise"))
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(model.noiseState == 1 ? AnyShapeStyle(Color.red.opacity(0.85)) : AnyShapeStyle(Theme.gradient),
+                                    in: Capsule())
+                        .foregroundStyle(Color.white)
+                }.buttonStyle(.plain)
+            }
+
+            if model.noiseState == 1 {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.1))
+                        Capsule().fill(Theme.gradient)
+                            .frame(width: max(6, geo.size.width * model.noiseProgress))
+                    }
+                }
+                .frame(height: 4)
+            }
+        }
+        .padding(.horizontal, 11).padding(.vertical, 8)
+        .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.1)))
+    }
+
     private func fileBar(icon: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: icon).foregroundStyle(Theme.accent)
                 Text(label).lineLimit(1)
                 Spacer()
-                Image(systemName: "chevron.up.chevron.down").font(.caption2).foregroundStyle(.secondary)
+                Image(systemName: "chevron.up.chevron.down").font(.caption2).foregroundStyle(Color.secondary)
             }
             .font(.system(size: 12.5, weight: .medium, design: .rounded))
             .padding(.horizontal, 11).padding(.vertical, 8)
             .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.1)))
-        }.buttonStyle(.plain).foregroundStyle(.white)
+        }.buttonStyle(.plain).foregroundStyle(Color.white)
     }
 
     // MARK: - Modal Pickers (Models / Cab IRs / Presets)
@@ -351,12 +439,12 @@ struct PluginView: View {
             HStack {
                 Text(title).font(.headline)
                 Spacer()
-                if current != nil { Button("Unload") { onPick(nil) }.foregroundStyle(.secondary) }
+                if current != nil { Button("Unload") { onPick(nil) }.foregroundStyle(Color.secondary) }
                 Button("Import…") { model.importAction?() }
                 Button("Done") { model.modal = .none }
             }
             if files.isEmpty {
-                Text(emptyText).font(.footnote).foregroundStyle(.secondary)
+                Text(emptyText).font(.footnote).foregroundStyle(Color.secondary)
                     .multilineTextAlignment(.center).padding()
             }
             ScrollView {
@@ -377,7 +465,10 @@ struct PluginView: View {
     }
 
     private var presetPickerContent: some View {
-        VStack(spacing: 8) {
+        let electric = PresetStore.factory.filter { $0.category == "electric" }
+        let acoustic = PresetStore.factory.filter { $0.category == "acoustic" }
+
+        return VStack(spacing: 8) {
             HStack {
                 Text("Rig Presets").font(.headline)
                 Spacer()
@@ -394,19 +485,16 @@ struct PluginView: View {
                 .buttonStyle(.borderedProminent).tint(Theme.accent)
                 .disabled(newPresetName.trimmingCharacters(in: .whitespaces).isEmpty)
             }
+
+            SegmentBar(options: ["All", "Electric", "Acoustic", "Saved"], selection: $presetFilter)
+
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
-                    if !model.userPresets.isEmpty {
-                        Text("USER RIGS").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary).padding(.top, 4)
+                    if (presetFilter == 0 || presetFilter == 3) && !model.userPresets.isEmpty {
+                        presetSectionHeader("SAVED RIGS")
                         ForEach(model.userPresets) { p in
                             HStack {
-                                Button { model.loadPreset(p) } label: {
-                                    HStack {
-                                        Text(p.name).lineLimit(1)
-                                        Spacer()
-                                        if p.name == model.presetName { Image(systemName: "checkmark").foregroundStyle(Theme.accent) }
-                                    }
-                                }.buttonStyle(.plain)
+                                presetRow(p)
                                 Button {
                                     PresetStore.delete(named: p.name)
                                     model.refreshLists()
@@ -416,20 +504,59 @@ struct PluginView: View {
                             }
                             .padding(10).background(Theme.card, in: RoundedRectangle(cornerRadius: 10))
                         }
+                    } else if presetFilter == 3 {
+                        Text("No saved rigs yet. Enter a name above and tap Save.")
+                            .font(.footnote).foregroundStyle(Color.secondary)
+                            .frame(maxWidth: .infinity).padding()
                     }
-                    Text("FACTORY TEMPLATES").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary).padding(.top, 4)
-                    ForEach(PresetStore.factory) { p in
-                        Button { model.loadPreset(p) } label: {
-                            HStack {
-                                Text(p.name).lineLimit(1)
-                                Spacer()
-                                if p.name == model.presetName { Image(systemName: "checkmark").foregroundStyle(Theme.accent) }
-                            }
-                            .padding(10).background(Theme.card, in: RoundedRectangle(cornerRadius: 10))
-                        }.buttonStyle(.plain)
+
+                    if presetFilter == 0 || presetFilter == 1 {
+                        presetSectionHeader("ELECTRIC")
+                        ForEach(electric) { p in
+                            presetRow(p)
+                                .padding(10).background(Theme.card, in: RoundedRectangle(cornerRadius: 10))
+                        }
+                    }
+
+                    if presetFilter == 0 || presetFilter == 2 {
+                        presetSectionHeader("ACOUSTIC")
+                        ForEach(acoustic) { p in
+                            presetRow(p)
+                                .padding(10).background(Theme.card, in: RoundedRectangle(cornerRadius: 10))
+                        }
                     }
                 }
             }
         }
+    }
+
+    private func presetSectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.secondary)
+            .padding(.top, 4)
+    }
+
+    private func presetRow(_ p: RigPreset) -> some View {
+        Button { model.loadPreset(p) } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(p.name)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.white)
+                        .lineLimit(1)
+                    if let sub = p.summary, !sub.isEmpty {
+                        Text(sub)
+                            .font(.system(size: 10.5, design: .rounded))
+                            .foregroundStyle(Color.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer()
+                if p.name == model.presetName {
+                    Image(systemName: "checkmark").foregroundStyle(Theme.accent)
+                }
+            }
+        }.buttonStyle(.plain)
     }
 }

@@ -13,11 +13,12 @@ struct ParamSpec {
 }
 
 enum EffectBlock: Int, CaseIterable, Identifiable {
-    case gate = 0, comp, drive, amp, cab, mod, delay, reverb
+    case gate = 0, comp, drive, amp, cab, mod, delay, reverb, denoise
     var id: Int { rawValue }
 
     var shortName: String {
         switch self {
+        case .denoise: return "DNS"
         case .gate: return "GATE"
         case .comp: return "COMP"
         case .drive: return "DRIVE"
@@ -31,6 +32,7 @@ enum EffectBlock: Int, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .denoise: return "Spectral Denoiser"
         case .gate: return "Noise Gate"
         case .comp: return "Compressor"
         case .drive: return "Overdrive"
@@ -44,6 +46,7 @@ enum EffectBlock: Int, CaseIterable, Identifiable {
 
     var icon: String {
         switch self {
+        case .denoise: return "wand.and.stars"
         case .gate: return "door.left.hand.closed"
         case .comp: return "arrow.down.right.and.arrow.up.left"
         case .drive: return "flame.fill"
@@ -55,18 +58,24 @@ enum EffectBlock: Int, CaseIterable, Identifiable {
         }
     }
 
-    var enableParamIndex: Int { 6 + rawValue }
+    var enableParamIndex: Int {
+        switch self {
+        case .denoise: return 42
+        default: return 6 + rawValue
+        }
+    }
 
     var knobIndices: [Int] {
         switch self {
-        case .gate:   return [1, 14]
-        case .comp:   return [15, 16, 17, 18, 19, 20]
-        case .drive:  return [21, 22, 23]
-        case .amp:    return [0, 2, 3, 4, 5]
-        case .cab:    return [25, 26, 27]
-        case .mod:    return [29, 30, 31]
-        case .delay:  return [33, 34, 35, 36]
-        case .reverb: return [38, 39, 40, 41]
+        case .denoise: return [43, 44, 45, 46]
+        case .gate:    return [1, 14]
+        case .comp:    return [15, 16, 17, 18, 19, 20]
+        case .drive:   return [21, 22, 23]
+        case .amp:     return [0, 2, 3, 4, 5]
+        case .cab:     return [25, 26, 27]
+        case .mod:     return [29, 30, 31]
+        case .delay:   return [33, 34, 35, 36]
+        case .reverb:  return [38, 39, 40, 41]
         }
     }
 
@@ -92,6 +101,8 @@ enum EffectBlock: Int, CaseIterable, Identifiable {
 }
 
 public final class ToneVaultAudioUnit: AUAudioUnit {
+    static let noiseBinCount = 129
+
     static let specs: [ParamSpec] = [
         // 0..5 Legacy core
         .init(name: "Input", min: -20, max: 20, def: 0, unit: "dB"),
@@ -144,6 +155,12 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
         .init(name: "Pre-Delay", min: 0, max: 120, def: 20, unit: "ms"),
         .init(name: "Damping", min: 1000, max: 14000, def: 6500, unit: "Hz"),
         .init(name: "Mix", min: 0, max: 100, def: 25, unit: "%"),
+        // 42..46 Spectral Denoiser
+        .init(name: "Denoise On", min: 0, max: 1, def: 0, unit: ""),
+        .init(name: "Reduction", min: 0, max: 42, def: 24, unit: "dB"),
+        .init(name: "Sensitivity", min: -12, max: 18, def: 3, unit: "dB"),
+        .init(name: "Smooth", min: 0, max: 100, def: 45, unit: "%"),
+        .init(name: "Mix", min: 0, max: 100, def: 100, unit: "%"),
     ]
 
     private let engine: NAMEngineRef = NAMEngineCreate()
@@ -160,7 +177,7 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
     private(set) var modelName: String?
     private(set) var irName: String?
     private(set) var presetName: String = "Default"
-    private(set) var chainOrder: [Int] = Array(0..<EffectBlock.allCases.count)
+    private(set) var chainOrder: [Int] = [8, 0, 1, 2, 3, 4, 5, 6, 7]
 
     public override init(componentDescription: AudioComponentDescription,
                          options: AudioComponentInstantiationOptions = []) throws {
@@ -238,6 +255,18 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
             NAMEngineProcess(eng, inp, l, r, Int32(frames))
             return noErr
         }
+    }
+
+    // MARK: - Spectral Denoiser Controls
+    var noiseLearnState: Int { Int(NAMEngineGetNoiseLearnState(engine)) }
+    var noiseLearnProgress: Double { Double(NAMEngineGetNoiseLearnProgress(engine)) }
+
+    func startNoiseLearn(seconds: Float = 1.5) {
+        NAMEngineStartNoiseLearn(engine, seconds)
+    }
+
+    func clearNoiseProfile() {
+        NAMEngineClearNoiseProfile(engine)
     }
 
     // MARK: - NAM Model Loading
@@ -319,9 +348,15 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
 
     // MARK: - Chain Order & Presets
     func setChainOrder(_ order: [Int]) {
-        guard order.count == EffectBlock.allCases.count, Set(order).count == order.count else { return }
-        chainOrder = order
-        let cOrder = order.map { Int32($0) }
+        var normalized = order
+        let count = EffectBlock.allCases.count
+        // Auto-migrate older 8-block presets by prepending Denoise (8)
+        if normalized.count == count - 1 && !normalized.contains(EffectBlock.denoise.rawValue) {
+            normalized.insert(EffectBlock.denoise.rawValue, at: 0)
+        }
+        guard normalized.count == count, Set(normalized).count == count else { return }
+        chainOrder = normalized
+        let cOrder = normalized.map { Int32($0) }
         cOrder.withUnsafeBufferPointer { ptr in
             NAMEngineSetChainOrder(engine, ptr.baseAddress, Int32(ptr.count))
         }
@@ -330,6 +365,9 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
 
     func applyPreset(_ preset: RigPreset) {
         setChainOrder(preset.chainOrder)
+        for (i, s) in Self.specs.enumerated() where i < params.count {
+            params[i].value = s.def
+        }
         for (idx, val) in preset.params where idx < params.count {
             params[idx].value = val
         }
@@ -344,11 +382,10 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
         for (i, p) in params.enumerated() { map[i] = p.value }
         presetName = name
         NotificationCenter.default.post(name: .toneVaultStateChanged, object: self)
-        return RigPreset(name: name, isFactory: false, chainOrder: chainOrder, params: map,
-                         modelName: modelName, irName: irName)
+        return RigPreset(name: name, isFactory: false, category: "user", summary: nil,
+                         chainOrder: chainOrder, params: map, modelName: modelName, irName: irName)
     }
 
-    // Remember full rig state in host sessions (Loopy Pro, AUM, GarageBand).
     public override var fullState: [String: Any]? {
         get {
             var s = super.fullState ?? [:]
@@ -356,6 +393,13 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
             if let ir = irName { s["irName"] = ir }
             s["chainOrder"] = chainOrder
             s["presetName"] = presetName
+            var bins = [Float](repeating: 0, count: Self.noiseBinCount)
+            let got = bins.withUnsafeMutableBufferPointer { ptr in
+                Int(NAMEngineGetNoiseProfile(engine, ptr.baseAddress, Int32(ptr.count)))
+            }
+            if got == Self.noiseBinCount {
+                s["noiseProfile"] = bins.withUnsafeBufferPointer { Data(buffer: $0) }
+            }
             return s
         }
         set {
@@ -364,6 +408,14 @@ public final class ToneVaultAudioUnit: AUAudioUnit {
             if let p = newValue?["presetName"] as? String { presetName = p }
             if let n = newValue?["modelName"] as? String, let u = ModelStore.url(named: n) { loadModel(url: u) }
             if let ir = newValue?["irName"] as? String, let u = IRStore.url(named: ir) { loadIR(url: u) }
+            if let data = newValue?["noiseProfile"] as? Data,
+               data.count == Self.noiseBinCount * MemoryLayout<Float>.size {
+                data.withUnsafeBytes { raw in
+                    let ptr = raw.bindMemory(to: Float.self)
+                    NAMEngineSetNoiseProfile(engine, ptr.baseAddress, Int32(ptr.count))
+                }
+                NotificationCenter.default.post(name: .toneVaultStateChanged, object: self)
+            }
         }
     }
 }

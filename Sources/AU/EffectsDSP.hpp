@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <atomic>
+#include <mutex>
 
 namespace tv {
 
@@ -653,6 +655,307 @@ struct FDNReverb {
 
             L[i] = inL * dry + outL * wet;
             R[i] = inR * dry + outR * wet;
+        }
+    }
+};
+
+// ============================================================================
+// Real-Time Spectral Wiener Denoiser (256-pt STFT, 75% overlap, ~5.3ms latency)
+// ============================================================================
+class SpectralDenoiser {
+public:
+    static constexpr int N = 256;
+    static constexpr int H = 64;
+    static constexpr int HALF = N / 2 + 1; // 129 bins (DC..Nyquist)
+
+    SpectralDenoiser() { initTables(); }
+
+    void prepare(double s) {
+        sr = (s > 1000.0) ? s : 48000.0;
+        resetBuffers();
+    }
+
+    void resetBuffers() {
+        for (int c = 0; c < 2; ++c) {
+            inRing[c].fill(0.0f);
+            outRing[c].fill(0.0f);
+            prevCleanPow[c].fill(0.0f);
+            prevGain[c].fill(1.0f);
+        }
+        inPos = 0;
+        outPos = 0;
+        hopCount = 0;
+    }
+
+    // Call from UI thread: seconds > 0 starts timed capture, seconds <= 0 cancels
+    void startLearn(float seconds) {
+        if (seconds <= 0.0f) {
+            cancelTrigger.store(true, std::memory_order_release);
+            return;
+        }
+        int frames = std::max(8, (int)std::lround((seconds * sr) / (double)H));
+        learnTarget.store(frames, std::memory_order_relaxed);
+        learnTrigger.store(true, std::memory_order_release);
+        learnState.store(1, std::memory_order_release);
+        learnProgress.store(0.0f, std::memory_order_relaxed);
+    }
+
+    void clearProfile() {
+        clearTrigger.store(true, std::memory_order_release);
+        learnState.store(0, std::memory_order_release);
+        learnProgress.store(0.0f, std::memory_order_relaxed);
+    }
+
+    int getState() const { return learnState.load(std::memory_order_acquire); }
+    float getProgress() const { return learnProgress.load(std::memory_order_relaxed); }
+
+    int getProfile(float *outBins, int maxBins) {
+        if (!outBins || maxBins < HALF) return 0;
+        std::lock_guard<std::mutex> lk(profileMtx);
+        if (!savedHasProfile) return 0;
+        std::memcpy(outBins, savedProfile.data(), HALF * sizeof(float));
+        return HALF;
+    }
+
+    void setProfile(const float *bins, int count) {
+        if (!bins || count != HALF) return;
+        {
+            std::lock_guard<std::mutex> lk(profileMtx);
+            std::memcpy(stagingProfile.data(), bins, HALF * sizeof(float));
+            std::memcpy(savedProfile.data(), bins, HALF * sizeof(float));
+            savedHasProfile = true;
+        }
+        incomingProfile.store(true, std::memory_order_release);
+        learnState.store(2, std::memory_order_release);
+        learnProgress.store(1.0f, std::memory_order_relaxed);
+    }
+
+    void process(float *L, float *R, int n, float redDb, float sensDb, float smoothPct, float mixPct) {
+        if (clearTrigger.exchange(false, std::memory_order_acquire)) {
+            noisePow.fill(0.0f);
+            hasProfile = false;
+            learning = false;
+            savePending = false;
+            learnState.store(0, std::memory_order_release);
+            learnProgress.store(0.0f, std::memory_order_relaxed);
+            std::unique_lock<std::mutex> lk(profileMtx, std::try_to_lock);
+            if (lk.owns_lock()) savedHasProfile = false;
+        }
+        if (cancelTrigger.exchange(false, std::memory_order_acquire)) {
+            learning = false;
+            learnState.store(hasProfile ? 2 : 0, std::memory_order_release);
+            learnProgress.store(hasProfile ? 1.0f : 0.0f, std::memory_order_relaxed);
+        }
+        if (learnTrigger.exchange(false, std::memory_order_acquire)) {
+            learnAccum.fill(0.0f);
+            learnCount = 0;
+            learnGoal = std::max(8, learnTarget.load(std::memory_order_relaxed));
+            learning = true;
+            learnState.store(1, std::memory_order_release);
+            learnProgress.store(0.0f, std::memory_order_relaxed);
+        }
+        if (incomingProfile.exchange(false, std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lk(profileMtx, std::try_to_lock);
+            if (lk.owns_lock()) {
+                noisePow = stagingProfile;
+                hasProfile = true;
+                learning = false;
+                learnState.store(2, std::memory_order_release);
+                learnProgress.store(1.0f, std::memory_order_relaxed);
+            } else {
+                incomingProfile.store(true, std::memory_order_release);
+            }
+        }
+        if (savePending) {
+            std::unique_lock<std::mutex> lk(profileMtx, std::try_to_lock);
+            if (lk.owns_lock()) {
+                savedProfile = noisePow;
+                savedHasProfile = hasProfile;
+                savePending = false;
+            }
+        }
+
+        const float wet = std::clamp(mixPct * 0.01f, 0.0f, 1.0f);
+        const float dry = 1.0f - wet;
+
+        for (int i = 0; i < n; ++i) {
+            // Phase-aligned dry sample (exact N-sample delay matching STFT latency)
+            const float dryL = inRing[0][inPos];
+            const float dryR = inRing[1][inPos];
+
+            inRing[0][inPos] = L[i];
+            inRing[1][inPos] = R[i];
+
+            const float wetL = outRing[0][outPos];
+            const float wetR = outRing[1][outPos];
+            outRing[0][outPos] = 0.0f;
+            outRing[1][outPos] = 0.0f;
+
+            inPos = (inPos + 1) & (N - 1);
+            outPos = (outPos + 1) & (N - 1);
+
+            if (++hopCount == H) {
+                hopCount = 0;
+                processFrame(redDb, sensDb, smoothPct);
+            }
+
+            L[i] = dryL * dry + wetL * wet;
+            R[i] = dryR * dry + wetR * wet;
+        }
+    }
+
+private:
+    double sr = 48000.0;
+    std::array<int, N> bitRev{};
+    std::array<float, N / 2> twCos{}, twSin{};
+    std::array<float, N> win{};
+
+    std::array<std::array<float, N>, 2> inRing{}, outRing{};
+    std::array<std::array<float, HALF>, 2> prevCleanPow{}, prevGain{};
+    int inPos = 0, outPos = 0, hopCount = 0;
+
+    std::array<float, N> reL{}, imL{}, reR{}, imR{};
+    std::array<float, HALF> noisePow{}, learnAccum{}, rawGain{};
+
+    bool hasProfile = false;
+    bool learning = false;
+    bool savePending = false;
+    int learnCount = 0, learnGoal = 1125;
+
+    std::atomic<int> learnTarget{1125};
+    std::atomic<int> learnState{0}; // 0: empty, 1: learning, 2: ready
+    std::atomic<float> learnProgress{0.0f};
+    std::atomic<bool> learnTrigger{false}, cancelTrigger{false}, clearTrigger{false}, incomingProfile{false};
+
+    std::mutex profileMtx;
+    std::array<float, HALF> stagingProfile{}, savedProfile{};
+    bool savedHasProfile = false;
+
+    void initTables() {
+        for (int i = 0; i < N; ++i) {
+            int r = 0, v = i;
+            for (int b = 0; b < 8; ++b) { r = (r << 1) | (v & 1); v >>= 1; }
+            bitRev[i] = r;
+            win[i] = std::sqrt(0.5f * (1.0f - std::cos(2.0f * kPi * (float)i / (float)N)));
+        }
+        for (int i = 0; i < N / 2; ++i) {
+            float ang = -2.0f * kPi * (float)i / (float)N;
+            twCos[i] = std::cos(ang);
+            twSin[i] = std::sin(ang);
+        }
+        for (int c = 0; c < 2; ++c) prevGain[c].fill(1.0f);
+    }
+
+    void fft(float *re, float *im, bool inverse) const {
+        for (int i = 0; i < N; ++i) {
+            int j = bitRev[i];
+            if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
+        }
+        const float sign = inverse ? -1.0f : 1.0f;
+        for (int len = 2; len <= N; len <<= 1) {
+            int half = len >> 1;
+            int step = N / len;
+            for (int i = 0; i < N; i += len) {
+                for (int j = 0; j < half; ++j) {
+                    float wr = twCos[j * step];
+                    float wi = sign * twSin[j * step];
+                    int u = i + j, v = i + j + half;
+                    float tr = re[v] * wr - im[v] * wi;
+                    float ti = re[v] * wi + im[v] * wr;
+                    re[v] = re[u] - tr;
+                    im[v] = im[u] - ti;
+                    re[u] += tr;
+                    im[u] += ti;
+                }
+            }
+        }
+        if (inverse) {
+            constexpr float invN = 1.0f / (float)N;
+            for (int i = 0; i < N; ++i) { re[i] *= invN; im[i] *= invN; }
+        }
+    }
+
+    void applyWienerChannel(int ch, float *re, float *im, float gFloor, float sensPow, float smooth) {
+        const float alphaDD = 0.84f + 0.13f * smooth;
+        const float fSm = 0.15f + 0.35f * smooth;
+        const float atk = 0.60f; // Fast attack preserves guitar pick transients
+        const float rel = 0.15f + 0.78f * smooth;
+
+        for (int k = 0; k < HALF; ++k) {
+            const float sigPow = re[k] * re[k] + im[k] * im[k];
+            const float nEst = std::max(noisePow[k] * sensPow, 1e-12f);
+            const float gamma = sigPow / nEst;
+            const float xi = alphaDD * (prevCleanPow[ch][k] / nEst) + (1.0f - alphaDD) * std::max(gamma - 1.0f, 0.0f);
+            const float gW = xi / (1.0f + xi);
+            rawGain[k] = std::clamp(gW, gFloor, 1.0f);
+        }
+
+        for (int k = 0; k < HALF; ++k) {
+            float gTarget = rawGain[k];
+            if (k > 0 && k < HALF - 1) {
+                gTarget = (1.0f - fSm) * rawGain[k] + 0.5f * fSm * (rawGain[k - 1] + rawGain[k + 1]);
+            }
+            float g = prevGain[ch][k];
+            g = (gTarget > g) ? (g + atk * (gTarget - g)) : (rel * g + (1.0f - rel) * gTarget);
+            prevGain[ch][k] = g;
+
+            const float sigPow = re[k] * re[k] + im[k] * im[k];
+            prevCleanPow[ch][k] = (g * g) * sigPow;
+
+            re[k] *= g;
+            im[k] *= g;
+            if (k > 0 && k < N / 2) {
+                re[N - k] *= g;
+                im[N - k] *= g;
+            }
+        }
+    }
+
+    void processFrame(float redDb, float sensDb, float smoothPct) {
+        for (int k = 0; k < N; ++k) {
+            const int idx = (inPos + k) & (N - 1);
+            const float w = win[k];
+            reL[k] = inRing[0][idx] * w; imL[k] = 0.0f;
+            reR[k] = inRing[1][idx] * w; imR[k] = 0.0f;
+        }
+
+        fft(reL.data(), imL.data(), false);
+        fft(reR.data(), imR.data(), false);
+
+        if (learning) {
+            for (int k = 0; k < HALF; ++k) {
+                const float pL = reL[k] * reL[k] + imL[k] * imL[k];
+                const float pR = reR[k] * reR[k] + imR[k] * imR[k];
+                learnAccum[k] += 0.5f * (pL + pR);
+            }
+            ++learnCount;
+            learnProgress.store(std::min(1.0f, (float)learnCount / (float)learnGoal), std::memory_order_relaxed);
+            if (learnCount >= learnGoal) {
+                const float inv = 1.0f / (float)learnCount;
+                for (int k = 0; k < HALF; ++k) noisePow[k] = learnAccum[k] * inv;
+                hasProfile = true;
+                learning = false;
+                savePending = true;
+                learnState.store(2, std::memory_order_release);
+                learnProgress.store(1.0f, std::memory_order_relaxed);
+            }
+        } else if (hasProfile && redDb > 0.1f) {
+            const float gFloor = dbToLin(-std::clamp(redDb, 0.0f, 48.0f));
+            const float sensLin = dbToLin(std::clamp(sensDb, -18.0f, 24.0f));
+            const float sensPow = sensLin * sensLin;
+            const float smooth = std::clamp(smoothPct * 0.01f, 0.0f, 1.0f);
+            applyWienerChannel(0, reL.data(), imL.data(), gFloor, sensPow, smooth);
+            applyWienerChannel(1, reR.data(), imR.data(), gFloor, sensPow, smooth);
+        }
+
+        fft(reL.data(), imL.data(), true);
+        fft(reR.data(), imR.data(), true);
+
+        for (int k = 0; k < N; ++k) {
+            const int idx = (outPos + k) & (N - 1);
+            const float w = win[k] * 0.5f; // Root-Hann^2 * 0.5 = exact unity COLA at 75% overlap
+            outRing[0][idx] += reL[k] * w;
+            outRing[1][idx] += reR[k] * w;
         }
     }
 };
